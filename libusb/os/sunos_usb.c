@@ -37,7 +37,6 @@
 #include <sys/usb/clients/ugen/usb_ugen.h>
 #include <sys/usb/usba.h>
 #include <sys/pci.h>
-#include <inttypes.h>
 
 #include "libusbi.h"
 #include "sunos_usb.h"
@@ -56,36 +55,31 @@ typedef struct {
 /*
  * Backend functions
  */
-static int sunos_init(struct libusb_context *);
-static void sunos_exit(struct libusb_context *);
 static int sunos_get_device_list(struct libusb_context *,
     struct discovered_devs **);
 static int sunos_open(struct libusb_device_handle *);
 static void sunos_close(struct libusb_device_handle *);
-static int sunos_get_device_descriptor(struct libusb_device *,
-    uint8_t*, int *);
 static int sunos_get_active_config_descriptor(struct libusb_device *,
-    uint8_t*, size_t, int *);
+    void *, size_t);
 static int sunos_get_config_descriptor(struct libusb_device *, uint8_t,
-    uint8_t*, size_t, int *);
-static int sunos_get_configuration(struct libusb_device_handle *, int *);
+    void *, size_t);
+static int sunos_get_configuration(struct libusb_device_handle *, uint8_t *);
 static int sunos_set_configuration(struct libusb_device_handle *, int);
-static int sunos_claim_interface(struct libusb_device_handle *, int);
-static int sunos_release_interface(struct libusb_device_handle *, int);
+static int sunos_claim_interface(struct libusb_device_handle *, uint8_t);
+static int sunos_release_interface(struct libusb_device_handle *, uint8_t);
 static int sunos_set_interface_altsetting(struct libusb_device_handle *,
-    int, int);
-static int sunos_clear_halt(struct libusb_device_handle *, uint8_t);
+    uint8_t, uint8_t);
+static int sunos_clear_halt(struct libusb_device_handle *, unsigned char);
 static void sunos_destroy_device(struct libusb_device *);
 static int sunos_submit_transfer(struct usbi_transfer *);
 static int sunos_cancel_transfer(struct usbi_transfer *);
 static int sunos_handle_transfer_completion(struct usbi_transfer *);
-static int sunos_kernel_driver_active(struct libusb_device_handle *, int interface);
-static int sunos_detach_kernel_driver (struct libusb_device_handle *dev, int interface_number);
-static int sunos_attach_kernel_driver (struct libusb_device_handle *dev, int interface_number);
+static int sunos_kernel_driver_active(struct libusb_device_handle *, uint8_t);
+static int sunos_detach_kernel_driver(struct libusb_device_handle *, uint8_t);
+static int sunos_attach_kernel_driver(struct libusb_device_handle *, uint8_t);
 static int sunos_usb_open_ep0(sunos_dev_handle_priv_t *hpriv, sunos_dev_priv_t *dpriv);
 static int sunos_usb_ioctl(struct libusb_device *dev, int cmd);
 
-static struct devctl_iocdata iocdata;
 static int sunos_get_link(di_devlink_t devlink, void *arg)
 {
 	walk_link_t *larg = (walk_link_t *)arg;
@@ -155,6 +149,7 @@ sunos_usb_ioctl(struct libusb_device *dev, int cmd)
 	char path_arg[PATH_MAX];
 	sunos_dev_priv_t *dpriv;
 	devctl_ap_state_t devctl_ap_state;
+	struct devctl_iocdata iocdata;
 
 	dpriv = usbi_get_device_priv(dev);
 	phypath = dpriv->phypath;
@@ -195,7 +190,7 @@ sunos_usb_ioctl(struct libusb_device *dev, int cmd)
 
 	iocdata.cmd = DEVCTL_AP_GETSTATE;
 	iocdata.flags = 0;
-	iocdata.c_nodename = "hub";
+	iocdata.c_nodename = (char *)"hub";
 	iocdata.c_unitaddr = end;
 	iocdata.cpyout_buf = &devctl_ap_state;
 	usbi_dbg("%p, %" PRIuPTR, iocdata.nvl_user, iocdata.nvl_usersz);
@@ -226,10 +221,11 @@ sunos_usb_ioctl(struct libusb_device *dev, int cmd)
 }
 
 static int
-sunos_kernel_driver_active(struct libusb_device_handle *dev, int interface)
+sunos_kernel_driver_active(struct libusb_device_handle *dev_handle, uint8_t interface)
 {
-	sunos_dev_priv_t *dpriv;
-	dpriv = usbi_get_device_priv(dev->dev);
+	sunos_dev_priv_t *dpriv = usbi_get_device_priv(dev_handle->dev);
+
+	UNUSED(interface);
 
 	usbi_dbg("%s", dpriv->ugenpath);
 
@@ -247,12 +243,14 @@ sunos_new_string_list(void)
 {
 	string_list_t *list;
 
-	list = calloc(1, sizeof (string_list_t));
+	list = calloc(1, sizeof(string_list_t));
 	if (list == NULL)
 		return (NULL);
-	list->string = calloc(DEFAULT_LISTSIZE, sizeof (char *));
-	if (list->string == NULL)
+	list->string = calloc(DEFAULT_LISTSIZE, sizeof(char *));
+	if (list->string == NULL) {
+		free(list);
 		return (NULL);
+	}
 	list->nargs = 0;
 	list->listsize = DEFAULT_LISTSIZE;
 
@@ -269,7 +267,7 @@ sunos_append_to_string_list(string_list_t *list, const char *arg)
 
 	if ((list->nargs + 1) == list->listsize) { /* +1 is for NULL */
 		char	**tmp = realloc(list->string,
-		    sizeof (char *) * (list->listsize + 1));
+		    sizeof(char *) * (list->listsize + 1));
 		if (tmp == NULL) {
 			free(str);
 			return (-1);
@@ -348,13 +346,15 @@ sunos_exec_command(struct libusb_context *ctx, const char *path,
 
 static int
 sunos_detach_kernel_driver(struct libusb_device_handle *dev_handle,
-	int interface_number)
+	uint8_t interface_number)
 {
 	struct libusb_context *ctx = HANDLE_CTX(dev_handle);
 	string_list_t *list;
 	char path_arg[PATH_MAX];
 	sunos_dev_priv_t *dpriv;
 	int r;
+
+	UNUSED(interface_number);
 
 	dpriv = usbi_get_device_priv(dev_handle->dev);
 	snprintf(path_arg, sizeof(path_arg), "\'\"%s\"\'", dpriv->phypath);
@@ -389,8 +389,8 @@ sunos_detach_kernel_driver(struct libusb_device_handle *dev_handle,
 		usbi_warn(HANDLE_CTX(dev_handle), "one or more ioctls failed");
 
 	snprintf(path_arg, sizeof(path_arg), "^usb/%x.%x",
-	    libusb_le16_to_cpu(dpriv->dev_descr.idVendor),
-	    libusb_le16_to_cpu(dpriv->dev_descr.idProduct));
+	    dev_handle->dev->device_descriptor.idVendor,
+	    dev_handle->dev->device_descriptor.idProduct);
 	sunos_physpath_to_devlink(dpriv->phypath, path_arg, &dpriv->ugenpath);
 
 	if (access(dpriv->ugenpath, F_OK) == -1) {
@@ -403,13 +403,15 @@ sunos_detach_kernel_driver(struct libusb_device_handle *dev_handle,
 
 static int
 sunos_attach_kernel_driver(struct libusb_device_handle *dev_handle,
-	int interface_number)
+	uint8_t interface_number)
 {
 	struct libusb_context *ctx = HANDLE_CTX(dev_handle);
 	string_list_t *list;
 	char path_arg[PATH_MAX];
 	sunos_dev_priv_t *dpriv;
 	int r;
+
+	UNUSED(interface_number);
 
 	/* we open the dev in detach driver, so we need close it first. */
 	sunos_close(dev_handle);
@@ -457,7 +459,6 @@ sunos_fill_in_dev_info(di_node_t node, struct libusb_device *dev)
 	int	*i, n, *addr, *port_prop;
 	char	*phypath;
 	uint8_t	*rdata;
-	struct libusb_device_descriptor	*descr;
 	sunos_dev_priv_t	*dpriv = usbi_get_device_priv(dev);
 	char	match_str[PATH_MAX];
 
@@ -465,16 +466,9 @@ sunos_fill_in_dev_info(di_node_t node, struct libusb_device *dev)
 	proplen = di_prop_lookup_bytes(DDI_DEV_T_ANY, node,
 	    "usb-dev-descriptor", &rdata);
 	if (proplen <= 0) {
-
 		return (LIBUSB_ERROR_IO);
 	}
-
-	descr = (struct libusb_device_descriptor *)rdata;
-	bcopy(descr, &dpriv->dev_descr, LIBUSB_DT_DEVICE_SIZE);
-	dpriv->dev_descr.bcdUSB = libusb_cpu_to_le16(descr->bcdUSB);
-	dpriv->dev_descr.idVendor = libusb_cpu_to_le16(descr->idVendor);
-	dpriv->dev_descr.idProduct = libusb_cpu_to_le16(descr->idProduct);
-	dpriv->dev_descr.bcdDevice = libusb_cpu_to_le16(descr->bcdDevice);
+	bcopy(rdata, &dev->device_descriptor, LIBUSB_DT_DEVICE_SIZE);
 
 	/* Raw configuration descriptors */
 	proplen = di_prop_lookup_bytes(DDI_DEV_T_ANY, node,
@@ -505,8 +499,8 @@ sunos_fill_in_dev_info(di_node_t node, struct libusb_device *dev)
 	if (phypath) {
 		dpriv->phypath = strdup(phypath);
 		snprintf(match_str, sizeof(match_str), "^usb/%x.%x",
-		    libusb_le16_to_cpu(dpriv->dev_descr.idVendor),
-		    libusb_le16_to_cpu(dpriv->dev_descr.idProduct));
+		    dev->device_descriptor.idVendor,
+		    dev->device_descriptor.idProduct);
 		usbi_dbg("match is %s", match_str);
 		sunos_physpath_to_devlink(dpriv->phypath, match_str,  &dpriv->ugenpath);
 		di_devfs_path_free(phypath);
@@ -536,10 +530,8 @@ sunos_fill_in_dev_info(di_node_t node, struct libusb_device *dev)
 		dev->speed = LIBUSB_SPEED_SUPER;
 	}
 
-	usbi_dbg("vid=%x pid=%x, path=%s, bus_nmber=0x%x, port_number=%d, "
-	    "speed=%d",
-	    libusb_le16_to_cpu(dpriv->dev_descr.idVendor),
-	    libusb_le16_to_cpu(dpriv->dev_descr.idProduct),
+	usbi_dbg("vid=%x pid=%x, path=%s, bus_nmber=0x%x, port_number=%d, speed=%d",
+	    dev->device_descriptor.idVendor, dev->device_descriptor.idProduct,
 	    dpriv->phypath, dev->bus_number, dev->port_number, dev->speed);
 
 	return (LIBUSB_SUCCESS);
@@ -560,8 +552,10 @@ sunos_add_devices(di_devlink_t link, void *arg)
 	int			i = 0;
 	int			*addr_prop;
 	uint8_t			bus_number = 0;
-	uint32_t * 		regbuf = NULL;
+	uint32_t *		regbuf = NULL;
 	uint32_t		reg;
+
+	UNUSED(link);
 
 	nargs = (struct node_args *)largs->nargs;
 	myself = largs->myself;
@@ -625,7 +619,7 @@ sunos_add_devices(di_devlink_t link, void *arg)
 
 			if (sunos_fill_in_dev_info(dn, dev) != LIBUSB_SUCCESS) {
 				libusb_unref_device(dev);
-				usbi_dbg("get infomation fail");
+				usbi_dbg("get information fail");
 				continue;
 			}
 			if (usbi_sanitize_device(dev) < 0) {
@@ -720,7 +714,7 @@ sunos_get_device_list(struct libusb_context * ctx,
 	di_fini(root_node);
 	di_devlink_fini(&devlink_hdl);
 
-	usbi_dbg("%" PRIuPTR " devices", (*discdevs)->len);
+	usbi_dbg("%zu devices", (*discdevs)->len);
 
 	return ((*discdevs)->len);
 }
@@ -731,7 +725,6 @@ sunos_usb_open_ep0(sunos_dev_handle_priv_t *hpriv, sunos_dev_priv_t *dpriv)
 	char filename[PATH_MAX + 1];
 
 	if (hpriv->eps[0].datafd > 0) {
-
 		return (LIBUSB_SUCCESS);
 	}
 	snprintf(filename, PATH_MAX, "%s/cntrl0", dpriv->ugenpath);
@@ -773,7 +766,7 @@ sunos_usb_close_all_eps(sunos_dev_handle_priv_t *hdev)
 }
 
 static void
-sunos_usb_close_ep0(sunos_dev_handle_priv_t *hdev, sunos_dev_priv_t *dpriv)
+sunos_usb_close_ep0(sunos_dev_handle_priv_t *hdev)
 {
 	if (hdev->eps[0].datafd >= 0) {
 		close(hdev->eps[0].datafd);
@@ -864,17 +857,17 @@ sunos_check_device_and_status_open(struct libusb_device_handle *hdl,
 
 	/* create filename */
 	if (hpriv->config_index > 0) {
-		(void) snprintf(cfg_num, sizeof (cfg_num), "cfg%d",
+		(void) snprintf(cfg_num, sizeof(cfg_num), "cfg%d",
 		    hpriv->config_index + 1);
 	} else {
-		bzero(cfg_num, sizeof (cfg_num));
+		bzero(cfg_num, sizeof(cfg_num));
 	}
 
 	if (hpriv->altsetting[ifc] > 0) {
-		(void) snprintf(alt_num, sizeof (alt_num), ".%d",
+		(void) snprintf(alt_num, sizeof(alt_num), ".%d",
 		    hpriv->altsetting[ifc]);
 	} else {
-		bzero(alt_num, sizeof (alt_num));
+		bzero(alt_num, sizeof(alt_num));
 	}
 
 	(void) snprintf(filename, PATH_MAX, "%s/%sif%d%s%s%d",
@@ -920,7 +913,7 @@ sunos_check_device_and_status_open(struct libusb_device_handle *hdl,
 	if ((ep_type == LIBUSB_TRANSFER_TYPE_INTERRUPT) &&
 	    (ep_addr & LIBUSB_ENDPOINT_IN)) {
 		char	control = USB_EP_INTR_ONE_XFER;
-		int	count;
+		ssize_t	count;
 
 		/* Open the status endpoint with RDWR */
 		if ((fdstat = open(statfilename, O_RDWR)) == -1) {
@@ -929,7 +922,7 @@ sunos_check_device_and_status_open(struct libusb_device_handle *hdl,
 
 			return (errno);
 		} else {
-			count = write(fdstat, &control, sizeof (control));
+			count = write(fdstat, &control, sizeof(control));
 			if (count != 1) {
 				/* this should have worked */
 				usbi_dbg("can't write to %s: errno %d (%s)",
@@ -999,41 +992,18 @@ void
 sunos_close(struct libusb_device_handle *handle)
 {
 	sunos_dev_handle_priv_t *hpriv;
-	sunos_dev_priv_t *dpriv;
 
 	usbi_dbg(" ");
-	if (!handle) {
-		return;
-	}
 
 	hpriv = usbi_get_device_handle_priv(handle);
-	if (!hpriv) {
-		return;
-	}
-	dpriv = usbi_get_device_priv(handle->dev);
-	if (!dpriv) {
-		return;
-	}
 
 	sunos_usb_close_all_eps(hpriv);
-	sunos_usb_close_ep0(hpriv, dpriv);
-}
-
-int
-sunos_get_device_descriptor(struct libusb_device *dev, uint8_t *buf,
-    int *host_endian)
-{
-	sunos_dev_priv_t *dpriv = usbi_get_device_priv(dev);
-
-	memcpy(buf, &dpriv->dev_descr, LIBUSB_DT_DEVICE_SIZE);
-	*host_endian = 0;
-
-	return (LIBUSB_SUCCESS);
+	sunos_usb_close_ep0(hpriv);
 }
 
 int
 sunos_get_active_config_descriptor(struct libusb_device *dev,
-    uint8_t *buf, size_t len, int *host_endian)
+    void *buf, size_t len)
 {
 	sunos_dev_priv_t *dpriv = usbi_get_device_priv(dev);
 	struct libusb_config_descriptor *cfg;
@@ -1070,28 +1040,28 @@ sunos_get_active_config_descriptor(struct libusb_device *dev,
 	cfg = (struct libusb_config_descriptor *)dpriv->raw_cfgdescr;
 	len = MIN(len, libusb_le16_to_cpu(cfg->wTotalLength));
 	memcpy(buf, dpriv->raw_cfgdescr, len);
-	*host_endian = 0;
-	usbi_dbg("path:%s len %" PRIuPTR, dpriv->phypath, len);
+	usbi_dbg("path:%s len %zu", dpriv->phypath, len);
 
 	return (len);
 }
 
 int
 sunos_get_config_descriptor(struct libusb_device *dev, uint8_t idx,
-    uint8_t *buf, size_t len, int *host_endian)
+    void *buf, size_t len)
 {
+	UNUSED(idx);
 	/* XXX */
-	return(sunos_get_active_config_descriptor(dev, buf, len, host_endian));
+	return(sunos_get_active_config_descriptor(dev, buf, len));
 }
 
 int
-sunos_get_configuration(struct libusb_device_handle *handle, int *config)
+sunos_get_configuration(struct libusb_device_handle *handle, uint8_t *config)
 {
 	sunos_dev_priv_t *dpriv = usbi_get_device_priv(handle->dev);
 
 	*config = dpriv->cfgvalue;
 
-	usbi_dbg("bConfigurationValue %d", *config);
+	usbi_dbg("bConfigurationValue %u", *config);
 
 	return (LIBUSB_SUCCESS);
 }
@@ -1118,19 +1088,21 @@ sunos_set_configuration(struct libusb_device_handle *handle, int config)
 }
 
 int
-sunos_claim_interface(struct libusb_device_handle *handle, int iface)
+sunos_claim_interface(struct libusb_device_handle *handle, uint8_t iface)
 {
-	usbi_dbg("iface %d", iface);
+	UNUSED(handle);
+
+	usbi_dbg("iface %u", iface);
 
 	return (LIBUSB_SUCCESS);
 }
 
 int
-sunos_release_interface(struct libusb_device_handle *handle, int iface)
+sunos_release_interface(struct libusb_device_handle *handle, uint8_t iface)
 {
 	sunos_dev_handle_priv_t *hpriv = usbi_get_device_handle_priv(handle);
 
-	usbi_dbg("iface %d", iface);
+	usbi_dbg("iface %u", iface);
 
 	/* XXX: can we release it? */
 	hpriv->altsetting[iface] = 0;
@@ -1139,13 +1111,13 @@ sunos_release_interface(struct libusb_device_handle *handle, int iface)
 }
 
 int
-sunos_set_interface_altsetting(struct libusb_device_handle *handle, int iface,
-    int altsetting)
+sunos_set_interface_altsetting(struct libusb_device_handle *handle, uint8_t iface,
+    uint8_t altsetting)
 {
 	sunos_dev_priv_t *dpriv = usbi_get_device_priv(handle->dev);
 	sunos_dev_handle_priv_t *hpriv = usbi_get_device_handle_priv(handle);
 
-	usbi_dbg("iface %d, setting %d", iface, altsetting);
+	usbi_dbg("iface %u, setting %u", iface, altsetting);
 
 	if (dpriv->ugenpath == NULL)
 		return (LIBUSB_ERROR_NOT_FOUND);
@@ -1157,9 +1129,10 @@ sunos_set_interface_altsetting(struct libusb_device_handle *handle, int iface,
 }
 
 static void
-usb_dump_data(unsigned char *data, size_t size)
+usb_dump_data(const void *data, size_t size)
 {
-	int i;
+	const uint8_t *p = data;
+	size_t i;
 
 	if (getenv("LIBUSB_DEBUG") == NULL) {
 		return;
@@ -1168,9 +1141,9 @@ usb_dump_data(unsigned char *data, size_t size)
 	(void) fprintf(stderr, "data dump:");
 	for (i = 0; i < size; i++) {
 		if (i % 16 == 0) {
-			(void) fprintf(stderr, "\n%08x	", i);
+			(void) fprintf(stderr, "\n%08zx	", i);
 		}
-		(void) fprintf(stderr, "%02x ", (uchar_t)data[i]);
+		(void) fprintf(stderr, "%02x ", p[i]);
 	}
 	(void) fprintf(stderr, "\n");
 }
@@ -1230,7 +1203,7 @@ sunos_do_async_io(struct libusb_transfer *transfer)
 
 	tpriv->transfer = transfer;
 	aiocb = &tpriv->aiocb;
-	bzero(aiocb, sizeof (*aiocb));
+	bzero(aiocb, sizeof(*aiocb));
 	aiocb->aio_fildes = hpriv->eps[ep].datafd;
 	aiocb->aio_buf = transfer->buffer;
 	aiocb->aio_nbytes = transfer->length;
@@ -1251,13 +1224,13 @@ sunos_do_async_io(struct libusb_transfer *transfer)
 }
 
 /* return the number of bytes read/written */
-static int
-usb_do_io(int fd, int stat_fd, char *data, size_t size, int flag, int *status)
+static ssize_t
+usb_do_io(int fd, int stat_fd, void *data, size_t size, int flag, int *status)
 {
 	int error;
-	int ret = -1;
+	ssize_t ret = -1;
 
-	usbi_dbg("usb_do_io(): datafd=%d statfd=%d size=0x%" PRIxPTR " flag=%s",
+	usbi_dbg("usb_do_io(): datafd=%d statfd=%d size=0x%zx flag=%s",
 	    fd, stat_fd, size, flag? "WRITE":"READ");
 
 	switch (flag) {
@@ -1273,7 +1246,7 @@ usb_do_io(int fd, int stat_fd, char *data, size_t size, int flag, int *status)
 		break;
 	}
 
-	usbi_dbg("usb_do_io(): amount=%d", ret);
+	usbi_dbg("usb_do_io(): amount=%zd", ret);
 
 	if (ret < 0) {
 		int save_errno = errno;
@@ -1302,7 +1275,7 @@ usb_do_io(int fd, int stat_fd, char *data, size_t size, int flag, int *status)
 static int
 solaris_submit_ctrl_on_default(struct libusb_transfer *transfer)
 {
-	int		ret = -1, setup_ret;
+	ssize_t		ret = -1, setup_ret;
 	int		status;
 	sunos_dev_handle_priv_t *hpriv;
 	struct		libusb_device_handle *hdl = transfer->dev_handle;
@@ -1321,8 +1294,8 @@ solaris_submit_ctrl_on_default(struct libusb_transfer *transfer)
 	if ((data[0] & LIBUSB_ENDPOINT_DIR_MASK) == LIBUSB_ENDPOINT_IN) {
 		usbi_dbg("IN request");
 		ret = usb_do_io(hpriv->eps[0].datafd,
-		    hpriv->eps[0].statfd, (char *)data, LIBUSB_CONTROL_SETUP_SIZE,
-		    WRITE, (int *)&status);
+		    hpriv->eps[0].statfd, data, LIBUSB_CONTROL_SETUP_SIZE,
+		    WRITE, &status);
 	} else {
 		usbi_dbg("OUT request");
 		ret = usb_do_io(hpriv->eps[0].datafd, hpriv->eps[0].statfd,
@@ -1331,8 +1304,8 @@ solaris_submit_ctrl_on_default(struct libusb_transfer *transfer)
 	}
 
 	setup_ret = ret;
-	if (ret < LIBUSB_CONTROL_SETUP_SIZE) {
-		usbi_dbg("error sending control msg: %d", ret);
+	if (ret < (ssize_t)LIBUSB_CONTROL_SETUP_SIZE) {
+		usbi_dbg("error sending control msg: %zd", ret);
 
 		return (LIBUSB_ERROR_IO);
 	}
@@ -1342,18 +1315,17 @@ solaris_submit_ctrl_on_default(struct libusb_transfer *transfer)
 	/* Read the remaining bytes for IN request */
 	if ((wLength) && ((data[0] & LIBUSB_ENDPOINT_DIR_MASK) ==
 	    LIBUSB_ENDPOINT_IN)) {
-		usbi_dbg("DATA: %d", transfer->length - setup_ret);
+		usbi_dbg("DATA: %d", transfer->length - (int)setup_ret);
 		ret = usb_do_io(hpriv->eps[0].datafd,
 			hpriv->eps[0].statfd,
-			(char *)transfer->buffer + LIBUSB_CONTROL_SETUP_SIZE,
+			transfer->buffer + LIBUSB_CONTROL_SETUP_SIZE,
 			wLength, READ, (int *)&transfer->status);
 	}
 
 	if (ret >= 0) {
-		transfer->actual_length = ret;
 		LIBUSB_TRANSFER_TO_USBI_TRANSFER(transfer)->transferred = ret;
 	}
-	usbi_dbg("Done: ctrl data bytes %d", ret);
+	usbi_dbg("Done: ctrl data bytes %zd", ret);
 
 	/**
 	 * Sync transfer handling.
@@ -1369,7 +1341,7 @@ solaris_submit_ctrl_on_default(struct libusb_transfer *transfer)
 }
 
 int
-sunos_clear_halt(struct libusb_device_handle *handle, uint8_t endpoint)
+sunos_clear_halt(struct libusb_device_handle *handle, unsigned char endpoint)
 {
 	int ret;
 
@@ -1388,7 +1360,8 @@ void
 sunos_destroy_device(struct libusb_device *dev)
 {
 	sunos_dev_priv_t *dpriv = usbi_get_device_priv(dev);
-	usbi_dbg("destroy everyting");
+
+	usbi_dbg("destroy everything");
 	free(dpriv->raw_cfgdescr);
 	free(dpriv->ugenpath);
 	free(dpriv->phypath);
@@ -1515,12 +1488,13 @@ _errno_to_libusb(int err)
 static int
 sunos_usb_get_status(int fd)
 {
-	int status, ret;
+	int status;
+	ssize_t ret;
 
 	usbi_dbg("sunos_usb_get_status(): fd=%d", fd);
 
-	ret = read(fd, &status, sizeof (status));
-	if (ret == sizeof (status)) {
+	ret = read(fd, &status, sizeof(status));
+	if (ret == sizeof(status)) {
 		switch (status) {
 		case USB_LC_STAT_NOERROR:
 			usbi_dbg("No Error");
@@ -1612,7 +1586,6 @@ const struct usbi_os_backend usbi_backend = {
         .name = "Solaris",
         .caps = 0,
         .get_device_list = sunos_get_device_list,
-        .get_device_descriptor = sunos_get_device_descriptor,
         .get_active_config_descriptor = sunos_get_active_config_descriptor,
         .get_config_descriptor = sunos_get_config_descriptor,
         .open = sunos_open,

@@ -24,9 +24,6 @@ LIBUSB_ROOT_ABS := $(LOCAL_PATH)/../..
 
 include $(CLEAR_VARS)
 
-LIBUSB_ROOT_REL := ../..
-LIBUSB_ROOT_ABS := $(LOCAL_PATH)/../..
-
 LOCAL_SRC_FILES := \
   $(LIBUSB_ROOT_REL)/libusb/core.c \
   $(LIBUSB_ROOT_REL)/libusb/descriptor.c \
@@ -35,7 +32,7 @@ LOCAL_SRC_FILES := \
   $(LIBUSB_ROOT_REL)/libusb/sync.c \
   $(LIBUSB_ROOT_REL)/libusb/strerror.c \
   $(LIBUSB_ROOT_REL)/libusb/os/linux_usbfs.c \
-  $(LIBUSB_ROOT_REL)/libusb/os/poll_posix.c \
+  $(LIBUSB_ROOT_REL)/libusb/os/events_posix.c \
   $(LIBUSB_ROOT_REL)/libusb/os/threads_posix.c \
   $(LIBUSB_ROOT_REL)/libusb/os/linux_netlink.c
 
